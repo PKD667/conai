@@ -45,7 +45,7 @@ if __name__ == "__main__":
 
     # do some testing
     # Example input
-    input_text = "Write 2 in church encoding."
+    input_text = "Write the succesor function in typed lambda calculus."
     # inference
     # Assuming the model is a causal language model
     # Use the model to generate predictions

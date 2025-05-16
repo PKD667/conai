@@ -3,7 +3,7 @@ from typing import Callable, Tuple, List, Dict, Any
 import numpy as np
 
 import typed_lambda_parser
-from typed_lambda_parser import TypeCheckError, ParserSyntaxError
+from typed_lambda_parser import TypeCheckError, ParserSyntaxError, Token
 
 # Type alias for the parsing function
 # The first argument to ParseFn is now the 'response generated so far'
@@ -50,7 +50,7 @@ def lambda_grammar_parse_fn(
         mask_np[eos_token_id] = True
     
     # Log warning if no tokens are allowed by the grammar
-    log_mask_warnings(mask_np, eos_token_id, current_response_text)
+    log_mask_warnings(mask_np, eos_token_id, current_response_text, all_token_strings)
     
     # Convert to torch tensor and return
     return torch.tensor(mask_np, dtype=torch.bool, device=context_ids.device)
@@ -58,42 +58,69 @@ def lambda_grammar_parse_fn(
 
 def is_valid_token_candidate(current_text: str, token_str: str) -> bool:
     """Determine if a token is valid to append to the current text."""
-    # Handle empty strings
-    if not (current_text + token_str).strip():
-        return any(c.isspace() for c in token_str) and token_str
     
-    test_expr = current_text + token_str
-    
-    # Try parsing the expression with the candidate token
+    test_expr_combined = current_text + token_str
+    test_expr_stripped = test_expr_combined.strip()
+
+    # 1. If the combined expression is empty or all whitespace,
+    #    it's a valid "empty" or "whitespace" prefix.
+    #    This allows starting with whitespace or adding more whitespace.
+    if not test_expr_stripped:
+        return True
+
     try:
-        lambda_tokens = typed_lambda_parser.tokenize(test_expr)
-        
-        # Skip empty token lists
-        if not lambda_tokens:
+        # Tokenize the combined expression
+        lambda_tokens = typed_lambda_parser.tokenize(test_expr_combined)
+
+        # If tokenization results in no tokens (e.g., test_expr was only comments or complex whitespace)
+        # and the stripped expression was not empty, this is an invalid state.
+        if not lambda_tokens and test_expr_stripped:
+            print(f"Tokenization resulted in no tokens for '{test_expr_combined}'. Invalid expression.")
             return False
-            
-        # Try to parse and type-check the expression
-        parser = typed_lambda_parser.Parser(lambda_tokens)
-        ast = parser.parse_expression()
         
+        # If there are no tokens and the string was empty/whitespace, it's caught by the first check.
+        # If there are no tokens from a non-empty, non-whitespace string, it's invalid.
+        if not lambda_tokens:
+            print(f"Tokenization resulted in no tokens for '{test_expr_combined}'. Invalid expression.")
+            return False
+
+        parser = typed_lambda_parser.Parser(lambda_tokens)
+        ast = parser.parse_expression() # Attempt to parse one expression
+        
+        # 2. NEW CHECK: Ensure all tokens were consumed by parse_expression.
+        # If parser.pos < len(parser.tokens), it means parse_expression() succeeded
+        # but did not consume all available tokens. This implies trailing characters
+        # that are not part of the *single* parsed expression (e.g., "(x) y").
+        if parser.tokens[parser.pos] != Token(type="EOF",value="") and parser.pos < len(parser.tokens):
+            print(f"Parser did not consume all tokens for '{test_expr_combined}'. Remaining tokens: {parser.tokens[parser.pos:]}")
+            return False
+
+        # 3. All tokens were consumed, now try to type-check the AST.
         try:
             typed_lambda_parser.infer_type(ast, {})
-            return True  # Valid expression with correct types
+            return True  # Valid expression, all tokens consumed, correct types.
         except TypeCheckError:
-            return False  # Valid syntax but type error
+            return False # Valid syntax, all tokens consumed, but a type error.
             
     except ParserSyntaxError as e:
-        # Check if this is a valid prefix that could become a valid expression
+        # A ParserSyntaxError means the current test_expr_combined is not a fully valid expression.
+        # Check if it's a valid prefix of a potentially valid expression.
         if is_valid_prefix(e):
-            return True
-            
-        # Special case for empty current text - check if token could start an expression
-        if not current_text.strip():
-            return could_start_expression(token_str)
-            
-        return False
+            # The expression is a valid prefix (error occurred at/near the end).
+            # Additional check: if current_text is empty, the token_str itself
+            # must be a valid start of an expression.
+            # is_valid_prefix alone might be true for single non-starting tokens like ')' or ':'.
+            if not current_text.strip() and not could_start_expression(token_str):
+                # Example: current_text="", token_str=")". test_expr_combined=")"
+                # is_valid_prefix(e) is True for ")", but could_start_expression(")") is False.
+                return False
+            return True # It's a valid prefix.
+        else:
+            # The syntax error occurred before the end of test_expr_combined,
+            # meaning it's not just incomplete but malformed earlier.
+            return False
         
-    except Exception:
+    except Exception: # Catch-all for other unexpected errors during parsing/tokenization.
         return False  # Fail closed on unexpected errors
 
 
@@ -119,7 +146,7 @@ def could_start_expression(token_str: str) -> bool:
         return False
 
 
-def log_mask_warnings(mask_np: np.ndarray, eos_token_id: int, current_response_text: str) -> None:
+def log_mask_warnings(mask_np: np.ndarray, eos_token_id: int, current_response_text: str, all_token_strings: Tuple[str, ...]) -> None:
     """Log warnings if the mask is too restrictive."""
     num_allowed = np.sum(mask_np)
     
@@ -132,6 +159,12 @@ def log_mask_warnings(mask_np: np.ndarray, eos_token_id: int, current_response_t
         print(f"\nWarning: No tokens allowed by lambda grammar/type rules for: '{current_response_text}'. Only EOS is permitted.")
     elif num_allowed < 5:  # Arbitrary small number to warn about very restricted choices
         print(f"\nWarning: Very few tokens ({num_allowed}) allowed for: '{current_response_text}'")
+        # print the allowed tokens
+        allowed_indices = np.where(mask_np)[0]
+        allowed_tokens = [all_token_strings[i] for i in allowed_indices]
+        print(f"Allowed token strings: {allowed_tokens}")
+        # For debugging, you might also want to see their indices:
+        # print(f"Allowed token indices: {allowed_indices.tolist()}")
 
 
 def apply_mask(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

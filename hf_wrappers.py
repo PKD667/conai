@@ -137,14 +137,18 @@ You are an AI assistant that translates natural language queries into formal typ
 The interaction will follow this structure:
 1. The user's query will be provided within <user>...</user> tags.
 2. First, you will engage in a "thinking" step. Your thoughts and reasoning should be enclosed in <think>...</think> tags. This is your scratchpad to break down the problem, plan the lambda expression, or note any ambiguities. You MUST explicitly close this tag with </think> when your thinking process is complete.
-3. After closing the </think> tag, you MUST open a <formal> tag.
 4. Inside the <formal>...</formal> tags, you will write ONLY the typed lambda calculus expression corresponding to the user's query.
 5. You MUST explicitly close the formal section with </formal> once the lambda expression is complete.
+Typed Lambda Calculus Grammar: 
+Lexical elements include `λ`/`\`/`lambda`, `->`, `()`, `:`, `.`, and identifiers. 
+Type syntax follows `Type ::= BaseType [-> Type]` and `BaseType ::= ID | (Type)` with right-associative function types. 
+Expressions are defined as `Expr ::= Abstraction | Application` where `Abstraction ::= λ ID:Type.Expr` creates functions and `Application ::= Atom {Atom}` applies them (left-associative). 
+Atomic expressions (`Atom ::= ID | (Expr)`) are either identifiers or parenthesized expressions. 
+Functions follow the standard syntax `λx:T.e` where x is a variable of type T and e is the body, while applications like `f x y` are parsed as `(f x) y` by default.
 </system>
 <user>identity function for any type A</user>
 <think>The user wants the identity function. In typed lambda calculus, this is `λx: A. x`. The type of this function will be `A -> A`.</think>
-<formal>λx: (A -> A).x
-</formal>
+<formal>λx: (A -> A).x</formal>
 """
 
         # Phase 1: Generate "think" content
