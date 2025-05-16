@@ -26,7 +26,7 @@ if __name__ == "__main__":
     print(f"Loading Hugging Face model: {model_name}")
     # Specify torch_dtype for model loading if desired, e.g., torch.bfloat16 or torch.float16
     # Ensure the chosen dtype is supported by the model and hardware.
-    model_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
+    model_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
     print(f"Using model dtype: {model_dtype}")
     hf_model = AutoModelForCausalLM.from_pretrained(
         model_name,

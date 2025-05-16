@@ -23,7 +23,6 @@ def passthrough_parse_fn(
     # Ensure the mask is on the same device as context_ids.
     return torch.ones(llm_tokenizer.vocab_size, dtype=torch.bool, device=context_ids.device)
 
-
 def lambda_grammar_parse_fn(
     current_response_text: str, 
     all_token_strings: Tuple[str, ...], 
@@ -34,81 +33,105 @@ def lambda_grammar_parse_fn(
     A ParseFn that uses the typed_lambda_parser to constrain token generation
     based on the current response text, including type checking.
     """
+    # Create a mask initialized to all False
     mask_np = np.zeros(llm_tokenizer.vocab_size, dtype=bool)
-
-    # Normalize potential lambda characters in the current response once
-    _current_response_text_normalized = current_response_text.replace('λ', 'lambda')
-
-    for i, token_candidate_str in enumerate(all_token_strings):
-        # Normalize potential lambda characters in the candidate token
-        _token_candidate_str_normalized = token_candidate_str.replace('λ', 'lambda')
-        print(f"Checking token candidate: '{_token_candidate_str_normalized}' against current response: '{_current_response_text_normalized}'")
-        
-        # test_expr_str is the current response being built + the candidate token string (both normalized)
-        test_expr_str = _current_response_text_normalized + _token_candidate_str_normalized
-        
-        try:
-            if not test_expr_str.strip():
-                if any(c.isspace() for c in _token_candidate_str_normalized) and _token_candidate_str_normalized:
-                    mask_np[i] = True
-                continue
-
-            lambda_tokens = typed_lambda_parser.tokenize(test_expr_str)
-            if not lambda_tokens and test_expr_str.strip():
-                pass
-            elif not lambda_tokens and not test_expr_str.strip():
-                pass
-            else:
-                parser = typed_lambda_parser.Parser(lambda_tokens)
-                ast = parser.parse_expression()
-                
-                try:
-                    typed_lambda_parser.infer_type(ast, {}) 
-                    mask_np[i] = True
-                except TypeCheckError:
-                    mask_np[i] = False
-                    
-        except ParserSyntaxError as e:
-            is_prefix = False
-            if e.parser_instance is not None:
-                local_parser_instance = e.parser_instance
-                if local_parser_instance.pos >= len(local_parser_instance.tokens) - 1:
-                    is_prefix = True
-            
-            if is_prefix:
-                mask_np[i] = True
-            elif not _current_response_text_normalized.strip():
-                try:
-                    candidate_lambda_tokens = typed_lambda_parser.tokenize(_token_candidate_str_normalized)
-                    if candidate_lambda_tokens:
-                        if candidate_lambda_tokens[0].type in ('IDENTIFIER', 'LAMBDA', 'LPAREN'):
-                            mask_np[i] = True
-                except ParserSyntaxError:
-                    pass
-        except Exception:
-            pass
-
-    num_allowed_by_grammar_rules = np.sum(mask_np)
-
+    
+    # Normalize lambda characters in the current response
+    normalized_response = current_response_text.replace('λ', 'lambda')
+    
+    # Process each token candidate
+    for i, token_str in enumerate(all_token_strings):
+        normalized_token = token_str.replace('λ', 'lambda')
+        mask_np[i] = is_valid_token_candidate(normalized_response, normalized_token)
+    
+    # Always allow EOS token if available
     eos_token_id = llm_tokenizer.eos_token_id
-    eos_added_to_mask = False
     if eos_token_id is not None and eos_token_id < llm_tokenizer.vocab_size:
-        if not mask_np[eos_token_id]:
-            eos_added_to_mask = True
         mask_np[eos_token_id] = True
     
-    mask = torch.tensor(mask_np, dtype=torch.bool, device=context_ids.device)
-    final_allowed_count = mask.sum().item()
+    # Log warning if no tokens are allowed by the grammar
+    log_mask_warnings(mask_np, eos_token_id, current_response_text)
+    
+    # Convert to torch tensor and return
+    return torch.tensor(mask_np, dtype=torch.bool, device=context_ids.device)
 
-    if num_allowed_by_grammar_rules == 0:
-        if final_allowed_count == 1 and eos_added_to_mask:
-            print(f"\nWarning: No tokens allowed by lambda grammar/type rules for response prefix: '{current_response_text}'. Only EOS is now permitted.")
-        elif final_allowed_count == 0:
-            print(f"\nWarning: No tokens allowed by lambda grammar/type rules for response prefix: '{current_response_text}' and EOS is not available/effective. Generation will likely stop.")
-        else:
-            print(f"\nWarning: Lambda grammar/type rules themselves allowed 0 tokens for response prefix: '{current_response_text}'. Current mask allows {final_allowed_count} token(s) (EOS may be included).")
 
-    return mask
+def is_valid_token_candidate(current_text: str, token_str: str) -> bool:
+    """Determine if a token is valid to append to the current text."""
+    # Handle empty strings
+    if not (current_text + token_str).strip():
+        return any(c.isspace() for c in token_str) and token_str
+    
+    test_expr = current_text + token_str
+    
+    # Try parsing the expression with the candidate token
+    try:
+        lambda_tokens = typed_lambda_parser.tokenize(test_expr)
+        
+        # Skip empty token lists
+        if not lambda_tokens:
+            return False
+            
+        # Try to parse and type-check the expression
+        parser = typed_lambda_parser.Parser(lambda_tokens)
+        ast = parser.parse_expression()
+        
+        try:
+            typed_lambda_parser.infer_type(ast, {})
+            return True  # Valid expression with correct types
+        except TypeCheckError:
+            return False  # Valid syntax but type error
+            
+    except ParserSyntaxError as e:
+        # Check if this is a valid prefix that could become a valid expression
+        if is_valid_prefix(e):
+            return True
+            
+        # Special case for empty current text - check if token could start an expression
+        if not current_text.strip():
+            return could_start_expression(token_str)
+            
+        return False
+        
+    except Exception:
+        return False  # Fail closed on unexpected errors
+
+
+def is_valid_prefix(parser_error: ParserSyntaxError) -> bool:
+    """Check if the parsing error occurred at the end, indicating a potential prefix."""
+    if parser_error.parser_instance is None:
+        return False
+        
+    parser_instance = parser_error.parser_instance
+    return parser_instance.pos >= len(parser_instance.tokens) - 1
+
+
+def could_start_expression(token_str: str) -> bool:
+    """Check if the token could potentially start a valid lambda expression."""
+    try:
+        tokens = typed_lambda_parser.tokenize(token_str)
+        if not tokens:
+            return False
+            
+        # Valid expression starters
+        return tokens[0].type in ('IDENTIFIER', 'LAMBDA', 'LPAREN')
+    except:
+        return False
+
+
+def log_mask_warnings(mask_np: np.ndarray, eos_token_id: int, current_response_text: str) -> None:
+    """Log warnings if the mask is too restrictive."""
+    num_allowed = np.sum(mask_np)
+    
+    # Check if only EOS is allowed
+    eos_only = (num_allowed == 1) and eos_token_id is not None and mask_np[eos_token_id]
+    
+    if num_allowed == 0:
+        print(f"\nWarning: No tokens allowed by lambda grammar/type rules for: '{current_response_text}'. Generation will likely stop.")
+    elif eos_only:
+        print(f"\nWarning: No tokens allowed by lambda grammar/type rules for: '{current_response_text}'. Only EOS is permitted.")
+    elif num_allowed < 5:  # Arbitrary small number to warn about very restricted choices
+        print(f"\nWarning: Very few tokens ({num_allowed}) allowed for: '{current_response_text}'")
 
 
 def apply_mask(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -210,11 +233,8 @@ def simplified_sampler(
         vocab_indices_np = np.arange(tokenizer.vocab_size).reshape(-1, 1)
         vocab_indices = torch.tensor(vocab_indices_np, dtype=torch.int32, device=full_input_ids.device)
         all_token_strings = batch_true_next_token_mapping(vocab_indices, tokenizer, full_input_ids)
-        print(all_token_strings)
-        print(current_response_str)
-        custom_mask = parse_fn(current_response_str, all_token_strings, tokenizer, full_input_ids)
 
-        print(custom_mask)
+        custom_mask = parse_fn(current_response_str, all_token_strings, tokenizer, full_input_ids)
         
         masked_logits = apply_mask(logits_for_next_token, custom_mask)
 

@@ -34,7 +34,7 @@ class FunctionType:
     
     def visualize(self,d=1) -> str:
         # show in tree form
-        return f"FunctionType(\n {" "*d} {self.param_type.visualize(d=d+1)}, \n {" "*d} {self.return_type.visualize(d=d+1)})"
+        return f"FunctionType(\n {' '*d} {self.param_type.visualize(d=d+1)}, \n {' '*d} {self.return_type.visualize(d=d+1)})"
 
 
 
@@ -65,7 +65,7 @@ class Abstraction:
 
     def visualize(self, d=1) -> str:
         # show in tree form
-        return f"Abstraction(\n {" "*d} {self.param_name}, \n {" "*d} {self.param_type.visualize(d=d+1)}, \n {" "*d} {self.body.visualize(d=d+1)})"
+        return f"Abstraction(\n {' '*d} {self.param_name}, \n {' '*d} {self.param_type.visualize(d=d+1)}, \n {' '*d} {self.body.visualize(d=d+1)})"
     
 
 @dataclass
@@ -78,7 +78,7 @@ class Application:
     
     def visualize(self, d=1) -> str:
         # show in tree form
-        return f"Application(\n {" "*d} {self.func.visualize(d=d+1)}, \n {" "*d} {self.arg.visualize(d=d+1)})"
+        return f"Application(\n {' '*d} {self.func.visualize(d=d+1)}, \n {' '*d} {self.arg.visualize(d=d+1)})"
 
 Expression = Union[Variable, Abstraction, Application]
 
@@ -143,7 +143,8 @@ class ParserSyntaxError(Exception):
         self.parser_instance = parser_instance # Store the parser instance if available
 
 TOKEN_SPECIFICATION = [
-    ('LAMBDA',     r'[λ\\]'),
+    # recognize Unicode λ, backslash \, or the literal "lambda"
+    ('LAMBDA',     r'(?:λ|\\|lambda)'),
     ('ARROW',      r'->'),
     ('LPAREN',     r'\('),
     ('RPAREN',     r'\)'),
@@ -367,7 +368,7 @@ if __name__ == '__main__':
     for type_str in test_types:
         print(f"Parsing type: {type_str}")
         try:
-            tokens = tokenize(type_str + " ") # Add space for EOF if needed by tokenizer logic
+            tokens = tokenize(type_str + ' ') # Add space for EOF if needed by tokenizer logic
             tokens_for_type = [t for t in tokens if t.type != 'EOF']
             
             parser = Parser(tokens_for_type + [Token('EOF', '')], debug=DEBUG_PARSER)
