@@ -220,64 +220,154 @@ def simplified_sampler(
     max_tokens: int = 50,
     stop_sequences: List[str] = None,
     entropy_limit: float = 0.5,
+    temperature: float = 1.0,
+    top_k: int = None,
+    min_p: float = 0.0
 ) -> Tuple[str, str | None]:
-    model_device_str = getattr(model, 'device', 'cpu')
-    model_device = torch.device(model_device_str)
+    # Determine model's device more robustly
+    if hasattr(model, 'device') and isinstance(model.device, torch.device):
+        model_device = model.device
+    else:
+        # Attempt to get device string and convert, with fallback
+        model_device_str = str(getattr(model, 'device', 'cpu')) 
+        try:
+            model_device = torch.device(model_device_str)
+        except RuntimeError:
+            print(f"Warning: Could not determine model device from '{model_device_str}'. Defaulting to CPU.")
+            model_device = torch.device('cpu')
     
     print(f"Using device for model inference: {model_device}")
 
     model.eval()
 
+    # Tokenize prompt and ensure it's on CPU for consistent concatenation later.
     tokenized_prompt = tokenizer([prompt_str], return_tensors="pt") 
-    full_input_ids = tokenized_prompt["input_ids"]
+    full_input_ids = tokenized_prompt["input_ids"].to('cpu') # Keep accumulated IDs on CPU
 
     if len(full_input_ids.shape) == 1:
         full_input_ids = full_input_ids.unsqueeze(0)
     
     if full_input_ids.shape[1] == 0 and prompt_str:
-        print(f"Warning: Prompt '{prompt_str}' tokenized to an empty sequence by the wrapper. This may cause issues.")
+        print(f"Warning: Prompt '{prompt_str}' tokenized to an empty sequence. This may cause issues.")
 
     current_response_str = ""
     found_stop_sequence = None
     
-    current_model_input_ids = full_input_ids
+    current_model_input_ids = full_input_ids # This will be moved to model_device in the loop
 
     for i in range(max_tokens):
-        outputs = model(input_ids=current_model_input_ids) 
+        # Ensure input_ids are on the model's device for inference
+        model_input_ids_on_device = current_model_input_ids.to(model_device)
+        outputs = model(input_ids=model_input_ids_on_device) 
         
-        logits_for_next_token = outputs.logits[:, -1, :] 
+        logits_for_next_token = outputs.logits[:, -1, :] # Shape: (batch_size, vocab_size), on model_device
 
-        probs = torch.softmax(logits_for_next_token, dim=-1)
+        # Calculate probabilities (on model_device)
+        probs_unsorted = torch.softmax(logits_for_next_token, dim=-1)
 
-        # Corrected entropy calculation to handle p=0 cases
-        log_probs = torch.log(probs)
-        entropy = -torch.sum(probs * log_probs.where(probs > 0, torch.tensor(0.0, device=probs.device)), dim=-1)
+        # Entropy check
+        log_probs_unsorted = torch.log(probs_unsorted)
+        entropy = -torch.sum(probs_unsorted * log_probs_unsorted.where(probs_unsorted > 0, torch.tensor(0.0, device=probs_unsorted.device)), dim=-1)
         print(f"\nEntropy: {entropy.item()}", flush=True)
         if entropy.item() > entropy_limit:
             print(f"\nEntropy {entropy.item()} exceeds limit {entropy_limit}. Stopping generation.")
             break
 
-        vocab_indices_np = np.arange(tokenizer.vocab_size).reshape(-1, 1)
-        vocab_indices = torch.tensor(vocab_indices_np, dtype=torch.int32, device=full_input_ids.device)
-        all_token_strings = batch_true_next_token_mapping(vocab_indices, tokenizer, full_input_ids)
+        # Sort original logits by value to get sorted_indices and sorted_logits.
+        # sorted_indices contains original vocab indices, ordered by their logit values.
+        # sorted_logits contains logits, ordered by their own values (descending).
+        # Both are on model_device.
+        sorted_logits, sorted_indices = torch.sort(logits_for_next_token, dim=-1, descending=True)
 
-        custom_mask = parse_fn(current_response_str, all_token_strings, tokenizer, full_input_ids)
+        # Prepare token strings for parse_fn, ordered by probability.
+        # Assuming batch_size is 1 for this generation loop.
+        # sorted_indices is (1, vocab_size), squeeze to (vocab_size,), then unsqueeze to (vocab_size, 1) for batch_true_next_token_mapping.
+        # token_ids_for_parse_fn_sorted is on model_device; batch_true_next_token_mapping handles .cpu().
+        token_ids_for_parse_fn_sorted = sorted_indices.squeeze(0).unsqueeze(-1) 
+        all_token_strings_sorted = batch_true_next_token_mapping(
+            token_ids_for_parse_fn_sorted, 
+            tokenizer, 
+            full_input_ids # Pass CPU tensor as context for tokenizer methods
+        )
+
+        # Call parse_fn with sorted token strings.
+        # The returned mask (custom_mask_sorted) will correspond to this sorted order.
+        # parse_fn is expected to return the mask on the device of `context_ids` (full_input_ids -> CPU).
+        custom_mask_sorted = parse_fn(
+            current_response_str, 
+            all_token_strings_sorted, 
+            tokenizer, 
+            full_input_ids # Pass CPU tensor for context_ids, so mask is created on CPU
+        )
+        # custom_mask_sorted is now on CPU, shape (vocab_size,)
+
+        # Initialize logits_to_sample_from with the sorted logits (on model_device)
+        logits_to_sample_from = sorted_logits
+
+        # Apply top_k if specified (operates on sorted logits)
+        if top_k is not None and top_k > 0:
+            effective_top_k = min(top_k, logits_to_sample_from.shape[-1])
+            # Create a mask for the first effective_top_k elements in the sorted list
+            top_k_indices_range = torch.arange(logits_to_sample_from.shape[-1], device=model_device)
+            # top_k_on_sorted_mask is (vocab_size,), needs to be (1, vocab_size) for torch.where
+            top_k_on_sorted_mask = (top_k_indices_range < effective_top_k).unsqueeze(0) 
+            
+            logits_to_sample_from = torch.where(
+                top_k_on_sorted_mask, 
+                logits_to_sample_from, 
+                torch.tensor(-float("inf"), device=model_device)
+            )
+
+        # Apply min_p if specified (operates on potentially top_k'd sorted logits)
+        if min_p > 0.0:
+            # Calculate probabilities from current logits_to_sample_from (on model_device)
+            # Softmax handles -inf correctly (they become 0 probability).
+            current_probs_sorted = torch.softmax(logits_to_sample_from, dim=-1)
+            min_p_on_sorted_mask = current_probs_sorted >= min_p # Shape (batch_size, vocab_size)
+            logits_to_sample_from = torch.where(
+                min_p_on_sorted_mask, 
+                logits_to_sample_from, 
+                torch.tensor(-float("inf"), device=model_device)
+            )
         
-        masked_logits = apply_mask(logits_for_next_token, custom_mask)
+        # Apply the custom grammar mask (custom_mask_sorted) to logits_to_sample_from.
+        # custom_mask_sorted is on CPU, logits_to_sample_from is on model_device.
+        # apply_mask will move custom_mask_sorted to model_device.
+        masked_logits_sorted = apply_mask(logits_to_sample_from, custom_mask_sorted) # Result on model_device
 
-        if (masked_logits == -float("inf")).all().item() > 0:
-            print(f"\nWarning: All tokens masked out by parse_fn for response prefix '{current_response_str}'. Stopping generation.")
+        if (masked_logits_sorted == -float("inf")).all().item():
+            print(f"\nWarning: All tokens masked out by combined filters for response prefix '{current_response_str}'. Stopping generation.")
             break
+        
+        # Apply temperature
+        if temperature > 0.0: # Ensure float comparison
+            masked_logits_sorted = masked_logits_sorted / temperature
+        
+        # Get probabilities from final masked & tempered logits (on model_device)
+        masked_probs_sorted = torch.softmax(masked_logits_sorted, dim=-1)
+        
+        # Sample next token index (this index is relative to the sorted list)
+        if temperature > 0.0: # Ensure float comparison
+            next_token_relative_index = torch.multinomial(masked_probs_sorted, num_samples=1) # Shape (batch_size, 1), on model_device
+        else: # Greedy decoding
+            next_token_relative_index = torch.argmax(masked_logits_sorted, dim=-1, keepdim=True) # Shape (batch_size, 1), on model_device
 
-        next_token_index = torch.argmax(masked_logits, dim=-1, keepdim=True)
-
-        if tokenizer.eos_token_id is not None and next_token_index.item() == tokenizer.eos_token_id:
+        # Map the relative index back to the original vocabulary index.
+        # sorted_indices is (batch_size, vocab_size), on model_device.
+        # next_token_relative_index is (batch_size, 1), on model_device.
+        next_token_original_vocab_index = sorted_indices.gather(-1, next_token_relative_index) # Shape (batch_size, 1), on model_device
+        
+        # Check for EOS token using the original vocabulary index
+        if tokenizer.eos_token_id is not None and next_token_original_vocab_index.item() == tokenizer.eos_token_id:
             print("\nEOS token generated. Stopping.")
             break
         
-        next_token_tensor = next_token_index.to(full_input_ids.device).to(torch.int32)
+        # Prepare the next token tensor for concatenation. Move to CPU (device of full_input_ids).
+        next_token_tensor = next_token_original_vocab_index.to(device=full_input_ids.device, dtype=torch.int32) # Shape (batch_size, 1), on CPU
 
-        token_text = true_next_token_mapping(next_token_tensor, tokenizer, full_input_ids)
+        # Decode the chosen token to string (for logging and current_response_str)
+        # true_next_token_mapping expects prefix_ids on CPU if it uses .numpy() internally.
+        token_text = true_next_token_mapping(next_token_tensor, tokenizer, full_input_ids) 
         
         current_response_str += token_text
         
@@ -293,15 +383,10 @@ def simplified_sampler(
                     break 
             if found_stop_sequence:
                 break
-
-        #print(token_text, end="", flush=True)
-
-        full_input_ids = torch.cat((full_input_ids, next_token_tensor), dim=1)
-        current_model_input_ids = full_input_ids
         
-        if found_stop_sequence:
-            break
-
-    # Return only the newly generated response string and the stop sequence found (if any)
+        # Append the new token (on CPU) to full_input_ids (on CPU)
+        full_input_ids = torch.cat((full_input_ids, next_token_tensor), dim=1)
+        current_model_input_ids = full_input_ids # Update for the next iteration (will be moved to model_device at loop start)
+        
     return current_response_str, found_stop_sequence
 
