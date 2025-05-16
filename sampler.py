@@ -21,7 +21,8 @@ def passthrough_parse_fn(
     """
     # Allow all tokens by returning a mask of all True.
     # Ensure the mask is on the same device as context_ids.
-    return torch.ones(llm_tokenizer.vocab_size, dtype=torch.bool, device=context_ids.device)
+    # Size the mask based on the actual number of token strings provided.
+    return torch.ones(len(all_token_strings), dtype=torch.bool, device=context_ids.device)
 
 def lambda_grammar_parse_fn(
     current_response_text: str, 
@@ -32,9 +33,10 @@ def lambda_grammar_parse_fn(
     """
     A ParseFn that uses the typed_lambda_parser to constrain token generation
     based on the current response text, including type checking.
+    EOS token is handled by the sampler after this function returns.
     """
-    # Create a mask initialized to all False
-    mask_np = np.zeros(llm_tokenizer.vocab_size, dtype=bool)
+    # Create a mask initialized to all False, sized by len(all_token_strings)
+    mask_np = np.zeros(len(all_token_strings), dtype=bool)
     
     # Normalize lambda characters in the current response
     normalized_response = current_response_text.replace('λ', 'lambda')
@@ -44,13 +46,10 @@ def lambda_grammar_parse_fn(
         normalized_token = token_str.replace('λ', 'lambda')
         mask_np[i] = is_valid_token_candidate(normalized_response, normalized_token)
     
-    # Always allow EOS token if available
-    eos_token_id = llm_tokenizer.eos_token_id
-    if eos_token_id is not None and eos_token_id < llm_tokenizer.vocab_size:
-        mask_np[eos_token_id] = True
+    # EOS token handling is moved to the sampler.
     
     # Log warning if no tokens are allowed by the grammar
-    log_mask_warnings(mask_np, eos_token_id, current_response_text, all_token_strings)
+    log_mask_warnings(mask_np, current_response_text, all_token_strings)
     
     # Convert to torch tensor and return
     return torch.tensor(mask_np, dtype=torch.bool, device=context_ids.device)
@@ -146,17 +145,22 @@ def could_start_expression(token_str: str) -> bool:
         return False
 
 
-def log_mask_warnings(mask_np: np.ndarray, eos_token_id: int, current_response_text: str, all_token_strings: Tuple[str, ...]) -> None:
-    """Log warnings if the mask is too restrictive."""
+def log_mask_warnings(mask_np: np.ndarray, current_response_text: str, all_token_strings: Tuple[str, ...]) -> None:
+    """Log warnings if the mask is too restrictive. Assumes EOS is handled by sampler."""
     num_allowed = np.sum(mask_np)
     
-    # Check if only EOS is allowed
-    eos_only = (num_allowed == 1) and eos_token_id is not None and mask_np[eos_token_id]
-    
     if num_allowed == 0:
-        print(f"\nWarning: No tokens allowed by lambda grammar/type rules for: '{current_response_text}'. Generation will likely stop.")
-    elif eos_only:
-        print(f"\nWarning: No tokens allowed by lambda grammar/type rules for: '{current_response_text}'. Only EOS is permitted.")
+        print(f"\nWarning: No tokens allowed by lambda grammar/type rules for: '{current_response_text}'. Generation will likely stop or rely on EOS if sampler allows it.")
+    elif num_allowed == 1:
+        allowed_idx = -1
+        # Find the single allowed token string if possible (mask_np might be all False if num_allowed is 0 due to float precision)
+        if np.any(mask_np):
+            allowed_idx = np.where(mask_np)[0][0]
+            allowed_token_str = all_token_strings[allowed_idx]
+            print(f"\nWarning: Only 1 token ('{allowed_token_str}') allowed by lambda grammar for: '{current_response_text}'.")
+        else: # Should not happen if num_allowed == 1, but as a safeguard
+            print(f"\nWarning: Only 1 token allowed by lambda grammar (but couldn't identify which) for: '{current_response_text}'.")
+
     elif num_allowed < 5:  # Arbitrary small number to warn about very restricted choices
         print(f"\nWarning: Very few tokens ({num_allowed}) allowed for: '{current_response_text}'")
         # print the allowed tokens
@@ -300,6 +304,30 @@ def simplified_sampler(
             full_input_ids # Pass CPU tensor for context_ids, so mask is created on CPU
         )
         # custom_mask_sorted is now on CPU, shape (vocab_size,)
+
+        # Ensure EOS token is allowed if it exists and is part of the sorted tokens.
+        # custom_mask_sorted is on CPU. sorted_indices is on model_device.
+        if tokenizer.eos_token_id is not None:
+            # Bring sorted_indices (original vocab IDs) to CPU for comparison.
+            # sorted_indices shape is (batch_size, vocab_size). Assuming batch_size=1.
+            original_vocab_indices_sorted_cpu = sorted_indices.squeeze(0).cpu()
+            
+            # Find where the original EOS token ID appears in the sorted list of original IDs.
+            eos_matches_in_sorted_list = (original_vocab_indices_sorted_cpu == tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+            
+            if eos_matches_in_sorted_list.numel() > 0:
+                idx_eos_in_sorted_list = eos_matches_in_sorted_list[0].item()
+                # Ensure the found index is within the bounds of custom_mask_sorted.
+                # This should always be true if custom_mask_sorted has length vocab_size.
+                if idx_eos_in_sorted_list < custom_mask_sorted.shape[0]:
+                    custom_mask_sorted[idx_eos_in_sorted_list] = True
+                else:
+                    # This case should ideally not be reached if vocab_size is consistent.
+                    print(f"Warning: EOS token ID {tokenizer.eos_token_id} found at sorted index {idx_eos_in_sorted_list}, "
+                          f"which is out of bounds for mask of size {custom_mask_sorted.shape[0]}. EOS might not be allowed.")
+            # else: EOS token ID was not found among the tokens represented by sorted_indices.
+            # This could happen if eos_token_id is outside the model's actual vocab range,
+            # or has such low probability it's effectively not in sorted_indices (though sort covers all).
 
         # Initialize logits_to_sample_from with the sorted logits (on model_device)
         logits_to_sample_from = sorted_logits
