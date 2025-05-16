@@ -124,6 +124,9 @@ class TransformersModelWrapper:
         max_think_tokens: int = 50,
         max_formal_tokens: int = 250,
         entropy_limit: int = 8,
+        temperature: float = 0.1,
+        top_k: int = 50,
+        min_p: float = 0.01,
     ) -> str:
         """
         Generates a response in two phases:
@@ -188,7 +191,10 @@ Functions follow the standard syntax `λx:T.e` where x is a variable of type T a
             parse_fn=lambda_grammar_parse_fn,
             max_tokens=max_formal_tokens,
             stop_sequences=["</formal>"],
-            entropy_limit=entropy_limit * 0.5
+            entropy_limit=entropy_limit * 0.5,
+            temperature=temperature,
+            top_k=top_k,
+            min_p=min_p
         )
 
         formal_content_segment = newly_generated_formal_text
