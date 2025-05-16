@@ -1,6 +1,7 @@
 import re
 from dataclasses import dataclass
-from typing import Union, List, Tuple, Optional
+from typing import Union, List, Tuple, Optional, Dict
+import copy
 
 # --- AST Node Definitions ---
 
@@ -10,6 +11,10 @@ class TypeVariable:
 
     def __str__(self):
         return self.name
+    
+    def visualize(self,d=1) -> str:
+        # show in tree form
+        return f"TypeVariable({self.name})"
 
 @dataclass
 class FunctionType:
@@ -26,6 +31,12 @@ class FunctionType:
             return_type_str = f"({return_type_str})"
             
         return f"{param_str} -> {return_type_str}"
+    
+    def visualize(self,d=1) -> str:
+        # show in tree form
+        return f"FunctionType(\n {" "*d} {self.param_type.visualize(d=d+1)}, \n {" "*d} {self.return_type.visualize(d=d+1)})"
+
+
 
 Type = Union[TypeVariable, FunctionType]
 
@@ -35,6 +46,10 @@ class Variable:
 
     def __str__(self):
         return self.name
+    
+    def visualize(self,d=1) -> str:
+        # show in tree form
+        return f"Variable({self.name})"
 
 @dataclass
 class Abstraction:
@@ -48,6 +63,11 @@ class Abstraction:
             param_type_str = f"({param_type_str})"
         return f"(λ{self.param_name}:{param_type_str}. {self.body})"
 
+    def visualize(self, d=1) -> str:
+        # show in tree form
+        return f"Abstraction(\n {" "*d} {self.param_name}, \n {" "*d} {self.param_type.visualize(d=d+1)}, \n {" "*d} {self.body.visualize(d=d+1)})"
+    
+
 @dataclass
 class Application:
     func: 'Expression'
@@ -55,14 +75,72 @@ class Application:
 
     def __str__(self):
         return f"({self.func} {self.arg})"
+    
+    def visualize(self, d=1) -> str:
+        # show in tree form
+        return f"Application(\n {" "*d} {self.func.visualize(d=d+1)}, \n {" "*d} {self.arg.visualize(d=d+1)})"
 
 Expression = Union[Variable, Abstraction, Application]
+
+# --- Type Checking ---
+
+class TypeCheckError(Exception):
+    """Custom exception for type checking errors."""
+    pass
+
+TypeEnvironment = Dict[str, Type]
+
+def infer_type(expression: Expression, context: TypeEnvironment) -> Type:
+    """
+    Infers the type of an expression given a type environment (context).
+    Raises TypeCheckError if a type error is found.
+    """
+    if isinstance(expression, Variable):
+        if expression.name in context:
+            return context[expression.name]
+        else:
+            raise TypeCheckError(f"TypeCheckError: Free variable '{expression.name}' not found in context {context}.")
+    
+    elif isinstance(expression, Abstraction):
+        # Create a new context for the body of the abstraction
+        new_context = context.copy() # Use copy to avoid modifying the outer context
+        new_context[expression.param_name] = expression.param_type
+        
+        body_type = infer_type(expression.body, new_context)
+        return FunctionType(expression.param_type, body_type)
+        
+    elif isinstance(expression, Application):
+        func_type = infer_type(expression.func, context)
+        arg_type = infer_type(expression.arg, context)
+        
+        if not isinstance(func_type, FunctionType):
+            raise TypeCheckError(
+                f"TypeCheckError: Cannot apply non-function type '{func_type}' (from '{expression.func}') "
+                f"to argument '{expression.arg}' of type '{arg_type}'."
+            )
+        
+        # Check if the argument type matches the function's parameter type
+        # The __eq__ method of TypeVariable and FunctionType handles structural equality.
+        if func_type.param_type == arg_type:
+            return func_type.return_type
+        else:
+            raise TypeCheckError(
+                f"TypeCheckError: Type mismatch in application '{expression}'. "
+                f"Function '{expression.func}' expects argument of type '{func_type.param_type}', "
+                f"but received argument '{expression.arg}' of type '{arg_type}'."
+            )
+            
+    else:
+        # This case should ideally not be reached if Expression is correctly typed
+        raise TypeCheckError(f"TypeCheckError: Unknown expression type encountered: {type(expression)}")
 
 # --- Tokenizer ---
 
 # Define a custom exception for parsing errors to avoid conflict with built-in SyntaxError
 class ParserSyntaxError(Exception):
-    pass
+    def __init__(self, message, parser_instance=None):
+        super().__init__(message)
+        self.parser_instance = parser_instance # Store the parser instance if available
 
 TOKEN_SPECIFICATION = [
     ('LAMBDA',     r'[λ\\]'),
@@ -91,7 +169,7 @@ def tokenize(code: str) -> List[Token]:
         if kind == 'WHITESPACE':
             continue
         elif kind == 'MISMATCH':
-            raise ParserSyntaxError(f"Unexpected character: {value}")
+            raise ParserSyntaxError(f"Unexpected character: {value}") # No parser instance here
         tokens.append(Token(kind, value))
     tokens.append(Token('EOF', '')) # End of File token
     return tokens
@@ -99,122 +177,149 @@ def tokenize(code: str) -> List[Token]:
 # --- Parser ---
 
 class Parser:
-    def __init__(self, tokens: List[Token]):
+    def __init__(self, tokens: List[Token], debug: bool = False):
         self.tokens = tokens
         self.pos = 0
+        self.debug = debug
+        if self.debug:
+            print(f"Parser initialized with tokens: {self.tokens}")
+
+    def _log(self, message: str):
+        if self.debug:
+            print(f"[DEBUG Parser] Pos {self.pos}: {message}")
 
     def current_token(self) -> Optional[Token]:
-        if self.pos < len(self.tokens):
-            return self.tokens[self.pos]
-        return None
+        token = self.tokens[self.pos] if self.pos < len(self.tokens) else None
+        return token
 
     def advance(self):
+        token = self.current_token()
+        self._log(f"advance() from {token}")
         self.pos += 1
+        self._log(f"          to {self.current_token()}")
 
     def expect(self, token_type: str) -> Token:
         token = self.current_token()
+        self._log(f"expect({token_type}) - current: {token}")
         if token and token.type == token_type:
             self.advance()
+            self._log(f"expect({token_type}) - matched: {token}")
             return token
         expected_value = token_type
         actual_value = token.type if token else "EOF"
-        raise ParserSyntaxError(f"Expected token {expected_value} but got {actual_value}")
+        self._log(f"expect({token_type}) - FAILED. Expected {expected_value}, got {actual_value}")
+        raise ParserSyntaxError(f"Expected token {expected_value} but got {actual_value}", parser_instance=self)
 
     def parse(self) -> Expression:
+        self._log("parse() called")
         expr = self.parse_expression()
-        if self.current_token() and self.current_token().type != 'EOF':
-            raise ParserSyntaxError(f"Unexpected token {self.current_token()} at end of expression")
+        current = self.current_token()
+        if current and current.type != 'EOF':
+            self._log(f"parse() - Unexpected token {current} at end of expression")
+            raise ParserSyntaxError(f"Unexpected token {current} at end of expression", parser_instance=self)
+        self._log(f"parse() -> {expr}")
         return expr
 
-    # Type ::= BaseType { '->' BaseType }
-    # BaseType ::= IDENTIFIER | '(' Type ')'
     def parse_type(self) -> Type:
+        self._log(f"parse_type() called. Current token: {self.current_token()}")
         left_type = self.parse_base_type()
-        while self.current_token() and self.current_token().type == 'ARROW':
-            self.expect('ARROW')
-            right_type = self.parse_base_type()
-            left_type = FunctionType(left_type, right_type) # Right associative for A -> B -> C means A -> (B -> C)
-                                                            # but our structure FunctionType(param, return) naturally builds this
-                                                            # if we parse T1 -> T2 -> T3 as (T1 -> (T2 -> T3))
-                                                            # The loop structure T_left = Func(T_left, T_right) makes it left-associative.
-                                                            # We need to parse it as T1 -> (parse_type_rhs())
-        return left_type
-
-    def parse_type_recursive(self) -> Type: # Corrected for right-associativity
-        t1 = self.parse_base_type()
+        self._log(f"parse_type() - parsed base_type: {left_type}. Current token: {self.current_token()}")
         if self.current_token() and self.current_token().type == 'ARROW':
             self.expect('ARROW')
-            t2 = self.parse_type_recursive() # Recurse for the right part
-            return FunctionType(t1, t2)
-        return t1
-    
-    # Re-aliasing for clarity in the main parse method
-    parse_type = parse_type_recursive
+            self._log(f"parse_type() - found ARROW, parsing RHS. Current token: {self.current_token()}")
+            right_type = self.parse_type()
+            result = FunctionType(left_type, right_type)
+            self._log(f"parse_type() -> {result} (FunctionType)")
+            return result
+        self._log(f"parse_type() -> {left_type} (BaseType)")
+        return left_type
 
     def parse_base_type(self) -> Type:
         token = self.current_token()
+        self._log(f"parse_base_type() called. Current token: {token}")
         if token.type == 'IDENTIFIER':
             self.advance()
-            return TypeVariable(token.value)
+            result = TypeVariable(token.value)
+            self._log(f"parse_base_type() -> {result} (TypeVariable: {token.value})")
+            return result
         elif token.type == 'LPAREN':
             self.expect('LPAREN')
+            self._log(f"parse_base_type() - found LPAREN, parsing inner type. Current token: {self.current_token()}")
             type_expr = self.parse_type()
             self.expect('RPAREN')
+            self._log(f"parse_base_type() -> {type_expr} (Parenthesized Type)")
             return type_expr
         else:
-            raise ParserSyntaxError(f"Unexpected token {token} in type, expected IDENTIFIER or LPAREN")
+            self._log(f"parse_base_type() - FAILED. Unexpected token {token}")
+            raise ParserSyntaxError(f"Unexpected token {token} in type, expected IDENTIFIER or LPAREN", parser_instance=self)
 
-    # Expr ::= Abstraction | Application
     def parse_expression(self) -> Expression:
         token = self.current_token()
+        self._log(f"parse_expression() called. Current token: {token}")
         if token.type == 'LAMBDA':
-            return self.parse_abstraction()
+            result = self.parse_abstraction()
+            self._log(f"parse_expression() -> {result} (Abstraction)")
+            return result
         else:
-            return self.parse_application()
+            result = self.parse_application()
+            self._log(f"parse_expression() -> {result} (Application)")
+            return result
 
-    # Abstraction ::= (λ | \) IDENTIFIER ':' Type '.' Expr
     def parse_abstraction(self) -> Abstraction:
+        self._log(f"parse_abstraction() called. Current token: {self.current_token()}")
         self.expect('LAMBDA')
         param_name_token = self.expect('IDENTIFIER')
+        self._log(f"parse_abstraction() - param_name: {param_name_token.value}")
         self.expect('COLON')
         param_type = self.parse_type()
+        self._log(f"parse_abstraction() - param_type: {param_type}")
         self.expect('DOT')
         body = self.parse_expression()
-        return Abstraction(param_name_token.value, param_type, body)
+        self._log(f"parse_abstraction() - body: {body}")
+        result = Abstraction(param_name_token.value, param_type, body)
+        self._log(f"parse_abstraction() -> {result}")
+        return result
 
-    # Application ::= Atom { Atom } (left-associative)
     def parse_application(self) -> Expression:
+        self._log(f"parse_application() called. Current token: {self.current_token()}")
         expr = self.parse_atom()
+        self._log(f"parse_application() - parsed first atom: {expr}. Current token: {self.current_token()}")
         while True:
-            # Check if the next token could start an atom (for application)
-            # This handles cases like `x y z` which is `((x y) z)`
-            # or `(λx:A.x) y`
-            # We stop if we see EOF, RPAREN, DOT, COLON, ARROW, LAMBDA
-            # (tokens that cannot start an atom or are delimiters for other constructs)
             next_token = self.current_token()
+            self._log(f"parse_application() - in loop, next_token: {next_token}")
             if next_token and next_token.type in ('IDENTIFIER', 'LPAREN'):
+                self._log(f"parse_application() - applying to another atom. Current token: {self.current_token()}")
                 arg = self.parse_atom()
                 expr = Application(expr, arg)
+                self._log(f"parse_application() - new expr after application: {expr}. Current token: {self.current_token()}")
             else:
+                self._log(f"parse_application() - no more atoms to apply, breaking loop.")
                 break
+        self._log(f"parse_application() -> {expr}")
         return expr
 
-    # Atom ::= IDENTIFIER | '(' Expr ')'
     def parse_atom(self) -> Expression:
         token = self.current_token()
+        self._log(f"parse_atom() called. Current token: {token}")
         if token.type == 'IDENTIFIER':
             self.advance()
-            return Variable(token.value)
+            result = Variable(token.value)
+            self._log(f"parse_atom() -> {result} (Variable: {token.value})")
+            return result
         elif token.type == 'LPAREN':
             self.expect('LPAREN')
+            self._log(f"parse_atom() - found LPAREN, parsing inner expression. Current token: {self.current_token()}")
             expr = self.parse_expression()
             self.expect('RPAREN')
+            self._log(f"parse_atom() -> {expr} (Parenthesized Expression)")
             return expr
         else:
-            raise ParserSyntaxError(f"Unexpected token {token}, expected IDENTIFIER or LPAREN for an atom")
+            self._log(f"parse_atom() - FAILED. Unexpected token {token}")
+            raise ParserSyntaxError(f"Unexpected token {token}, expected IDENTIFIER or LPAREN for an atom", parser_instance=self)
 
 # --- Example Usage ---
 if __name__ == '__main__':
+    DEBUG_PARSER = False # Set to True to enable parser debugging
     test_expressions = [
         "x",
         "λx:T. x",
@@ -233,13 +338,21 @@ if __name__ == '__main__':
         print(f"Parsing: {expr_str}")
         try:
             tokens = tokenize(expr_str)
-            # print(f"Tokens: {tokens}")
-            parser = Parser(tokens)
+            parser = Parser(tokens, debug=DEBUG_PARSER)
             ast = parser.parse()
-            print(f"AST: {ast}")
+            print(f"AST: {ast.visualize()}")
             print(f"Stringified: {str(ast)}")
+
+            # Perform type checking
+            inferred_type = infer_type(ast, {}) # Empty context for closed terms
+            print(f"Inferred Type: {inferred_type}")
+
         except ParserSyntaxError as e:
             print(f"Syntax Error: {e}")
+        except TypeCheckError as e:
+            print(f"Type Check Error: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
         print("-" * 20)
 
     # Test type parsing specifically
@@ -255,10 +368,9 @@ if __name__ == '__main__':
         print(f"Parsing type: {type_str}")
         try:
             tokens = tokenize(type_str + " ") # Add space for EOF if needed by tokenizer logic
-            # Filter out EOF if it's not expected by parse_type directly
             tokens_for_type = [t for t in tokens if t.type != 'EOF']
             
-            parser = Parser(tokens_for_type + [Token('EOF', '')]) # Add EOF for parser's current_token logic
+            parser = Parser(tokens_for_type + [Token('EOF', '')], debug=DEBUG_PARSER)
             parsed_type = parser.parse_type()
             print(f"Parsed Type: {parsed_type}")
             print(f"Stringified Type: {str(parsed_type)}")

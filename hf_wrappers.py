@@ -1,15 +1,12 @@
-from tinygrad.tensor import Tensor
-from tinygrad import dtypes
+import torch
 import numpy as np
 from typing import List, Dict, Any
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
 
 # Import from sampler.py
 from sampler import simplified_sampler, lambda_grammar_parse_fn, passthrough_parse_fn
 # Assuming sampler.py is in the same directory, making it a relative import.
-# If not, adjust the import path accordingly (e.g., `import sampler` and then `sampler.simplified_sampler`).
 
 # --- Wrapper classes for Hugging Face Transformers ---
 
@@ -33,48 +30,48 @@ class TransformersTokenizerWrapper:
         
         self.vocab_size = self.hf_tokenizer.vocab_size
 
-    def __call__(self, text_list: List[str], return_tensors="pt") -> Dict[str, Tensor]:
+    def __call__(self, text_list: List[str], return_tensors="pt") -> Dict[str, torch.Tensor]:
         # Assuming simplified_sampler sends one prompt at a time.
         # For hf_tokenizer, "pt" means PyTorch tensor.
         if return_tensors != "pt":
-            raise ValueError("TransformersTokenizerWrapper currently only supports return_tensors='pt' (for tinygrad Tensor output)")
+            # This wrapper is now designed to output PyTorch tensors directly.
+            raise ValueError("TransformersTokenizerWrapper currently only supports return_tensors='pt' (for PyTorch Tensor output)")
 
         text = text_list[0]
         
-        input_ids_np: np.ndarray
+        input_ids_torch: torch.Tensor
         if not text: # Handle empty prompt specifically
-            # Use BOS token if available, otherwise EOS as a fallback start token for generation.
             start_token_id = self.hf_tokenizer.bos_token_id
             if start_token_id is None:
                 start_token_id = self.hf_tokenizer.eos_token_id
             
             if start_token_id is None:
-                # This case should be rare for generative models.
-                # If truly no BOS/EOS, model might not support unconditional generation well.
-                # As a last resort, could use a common token like space, but BOS/EOS is preferred.
                 raise ValueError("Tokenizer has no BOS or EOS token to start generation from an empty prompt.")
             
-            # Shape: (batch_size=1, sequence_length=1)
-            input_ids_np = np.array([[start_token_id]], dtype=np.int32)
+            # Shape: (batch_size=1, sequence_length=1), on CPU by default for torch.tensor
+            input_ids_torch = torch.tensor([[start_token_id]], dtype=torch.long)
         else:
             # Tokenize non-empty text
+            # HF tokenizer returns torch.Tensor on CPU by default.
             encoded = self.hf_tokenizer(text, return_tensors="pt", padding=False, truncation=True)
-            input_ids_torch = encoded.input_ids
+            input_ids_torch = encoded.input_ids # This is already a torch.Tensor
             
-            # Ensure input_ids is 2D: [batch_size, sequence_length]
-            # hf_tokenizer with a single string and return_tensors="pt" usually returns 2D.
             if input_ids_torch.ndim == 1:
-                input_ids_torch = input_ids_torch.unsqueeze(0) # Make it (1, seq_len)
+                input_ids_torch = input_ids_torch.unsqueeze(0) 
             
-            # Handle cases where tokenization of non-empty string might still result in empty tensor (highly unlikely for valid strings)
             if input_ids_torch.shape[1] == 0:
                  raise ValueError(f"Tokenization of non-empty prompt '{text}' resulted in zero tokens.")
-
-            input_ids_np = input_ids_torch.cpu().numpy().astype(np.int32)
         
-        # Convert NumPy array to tinygrad Tensor
-        # tinygrad.Tensor by default is on Device.DEFAULT (usually CPU)
-        return {"input_ids": Tensor(input_ids_np, dtype=dtypes.int32)}
+        # Ensure dtype is torch.int32 as expected by some downstream sampler logic (like vocab_indices creation)
+        # However, HF models typically expect torch.long (int64).
+        # The model wrapper will handle casting to torch.long if needed.
+        # For consistency within the sampler's own logic (like full_input_ids), let's use long.
+        return {"input_ids": input_ids_torch.to(torch.long)}
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+        """Encodes text into token IDs."""
+        # This method is added to be compatible with parse_fn expecting tokenizer.encode
+        return self.hf_tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
     def decode(self, token_ids: List[int], skip_special_tokens: bool = False) -> str:
         return self.hf_tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
@@ -85,44 +82,37 @@ class TransformersTokenizerWrapper:
 class TransformersModelWrapper:
     def __init__(self, hf_model: AutoModelForCausalLM, device: str):
         self.hf_model = hf_model
-        self.device = device
+        self.device = torch.device(device) # Store as torch.device
         self.hf_model.to(self.device)
         self.hf_model.eval() # Ensure model is in eval mode
 
-    def __call__(self, input_ids: Tensor, past_key_values=None, use_cache=None, attention_mask=None) -> Any:
-        # Convert tinygrad.Tensor to PyTorch tensor
-        # input_ids from tokenizer wrapper are int32. Transformers models expect int64 (torch.long).
-        input_ids_np = input_ids.numpy() 
-        pt_input_ids = torch.tensor(input_ids_np, dtype=torch.long).to(self.device)
+    def __call__(self, input_ids: torch.Tensor, past_key_values=None, use_cache=None, attention_mask=None) -> Any:
+        # input_ids is now expected to be a torch.Tensor.
+        # Ensure it's on the correct device and has the correct dtype (long).
+        pt_input_ids = input_ids.to(device=self.device, dtype=torch.long)
         
         pt_attention_mask = None
         if attention_mask is not None:
-            # Assuming attention_mask would also be tinygrad.Tensor if provided
-            pt_attention_mask = torch.tensor(attention_mask.numpy(), dtype=torch.long).to(self.device)
-        
-        # past_key_values are expected to be in the format returned by the Hugging Face model
-        # (which are PyTorch tensors on the correct device if use_cache=True was used previously)
+            # Assuming attention_mask would also be torch.Tensor if provided
+            pt_attention_mask = attention_mask.to(device=self.device, dtype=torch.long)
         
         with torch.no_grad():
             outputs = self.hf_model(
                 input_ids=pt_input_ids, 
                 attention_mask=pt_attention_mask,
-                past_key_values=past_key_values,
+                past_key_values=past_key_values, # Assumed to be torch tensors on self.device
                 use_cache=use_cache
             )
         
-        # Convert PyTorch logits tensor back to tinygrad.Tensor
-        # Logits should be float32.
-        # Move to CPU before converting to numpy, then to tinygrad.Tensor.
-        logits_np = outputs.logits.detach().cpu().numpy().astype(np.float32)
-        tg_logits = Tensor(logits_np, dtype=dtypes.float32) # tinygrad infers device (default CPU)
+        # outputs.logits is already a torch.Tensor on self.device.
+        # No conversion needed.
         
         class Output:
             def __init__(self, lgts, pkvs):
-                self.logits = lgts
-                self.past_key_values = pkvs # These are PyTorch past_key_values from the hf_model
+                self.logits = lgts # torch.Tensor
+                self.past_key_values = pkvs # PyTorch past_key_values from the hf_model
         
-        return Output(tg_logits, outputs.past_key_values)
+        return Output(outputs.logits, outputs.past_key_values)
 
     def eval(self): # For compatibility with Hugging Face API and existing code
         self.hf_model.eval()
@@ -132,7 +122,8 @@ class TransformersModelWrapper:
         prompt_str: str,
         tokenizer: TransformersTokenizerWrapper, # Pass the tokenizer wrapper instance
         max_think_tokens: int = 50,
-        max_formal_tokens: int = 50
+        max_formal_tokens: int = 250,
+        entropy_limit: int = 8,
     ) -> str:
         """
         Generates a response in two phases:
@@ -149,65 +140,72 @@ The interaction will follow this structure:
 3. After closing the </think> tag, you MUST open a <formal> tag.
 4. Inside the <formal>...</formal> tags, you will write ONLY the typed lambda calculus expression corresponding to the user's query.
 5. You MUST explicitly close the formal section with </formal> once the lambda expression is complete.
-
-Example of a complete interaction:
-<user>identity function for any type A</user><think>The user wants the identity function. In typed lambda calculus, this is `λx: A. x`. The type of this function will be `A -> A`.</think><formal>λx: (A -> A).x</formal>
-</system>"""
+</system>
+<user>identity function for any type A</user>
+<think>The user wants the identity function. In typed lambda calculus, this is `λx: A. x`. The type of this function will be `A -> A`.</think>
+<formal>λx: (A -> A).x
+</formal>
+"""
 
         # Phase 1: Generate "think" content
-        think_prompt_prefix = f"{system_prompt}\n<user>{prompt_str}</user>\n<think>"
+        think_phase_prompt = f"{system_prompt}\n<user>{prompt_str}</user>\n<think>"
         print(f"\n--- Starting Thinking Phase ---")
-        # Print only the user-relevant part of the prompt for brevity in logs
         print(f"User query: {prompt_str}\nStarting with: <think>", end="", flush=True)
 
-
-        generated_think_text_base, think_stop_seq_found = simplified_sampler(
+        # simplified_sampler now returns only the newly generated text part
+        newly_generated_think_text, think_stop_seq_found = simplified_sampler(
             model=self,
             tokenizer=tokenizer,
-            prompt_str=think_prompt_prefix,
-            parse_fn=passthrough_parse_fn, # Allow free generation for thoughts
+            prompt_str=think_phase_prompt, 
+            parse_fn=passthrough_parse_fn,
             max_tokens=max_think_tokens,
-            stop_sequences=["</think>"]
+            stop_sequences=["</think>"],
+            entropy_limit=entropy_limit
         )
         
-        current_full_text = generated_think_text_base
+        think_content_segment = newly_generated_think_text
         if think_stop_seq_found:
-            current_full_text += think_stop_seq_found 
+            # The newly_generated_think_text already includes the stop sequence
             print(f"\nThink phase ended with stop sequence: {think_stop_seq_found}")
         else:
-            current_full_text += "</think>" 
+            # If no stop sequence, ensure the tag is closed
+            think_content_segment += "</think>"
             print(f"\nThink phase ended (max_think_tokens: {max_think_tokens} reached). Appending </think>.")
         
+        text_after_think_phase = think_phase_prompt + think_content_segment
+
         # Phase 2: Generate "formal" content
-        formal_prompt_prefix = current_full_text + "\n<formal>"
+        formal_phase_prompt = text_after_think_phase + "\n<formal>"
         print(f"\n--- Starting Formal Phase ---")
         print(f"Starting with: <formal>", end="", flush=True)
 
-
-        generated_formal_text_base, formal_stop_seq_found = simplified_sampler(
+        newly_generated_formal_text, formal_stop_seq_found = simplified_sampler(
             model=self,
             tokenizer=tokenizer,
-            prompt_str=formal_prompt_prefix,
-            parse_fn=lambda_grammar_parse_fn, # Constrain with lambda grammar
+            prompt_str=formal_phase_prompt,
+            parse_fn=lambda_grammar_parse_fn,
             max_tokens=max_formal_tokens,
-            stop_sequences=["</formal>"] # Enable detection of </formal>
+            stop_sequences=["</formal>"],
+            entropy_limit=entropy_limit * 0.5
         )
 
-        final_text = generated_formal_text_base
+        formal_content_segment = newly_generated_formal_text
         if formal_stop_seq_found:
-            final_text += formal_stop_seq_found 
+            # The newly_generated_formal_text already includes the stop sequence
             print(f"\nFormal phase ended with stop sequence: {formal_stop_seq_found}")
         else:
-            final_text += "</formal>" 
+            # If no stop sequence, ensure the tag is closed
+            formal_content_segment += "</formal>"
             print(f"\nFormal phase ended (max_formal_tokens or EOS). Appending </formal>.")
         
+        final_full_text = formal_phase_prompt + formal_content_segment
+        
         print("\n--- Inference Complete ---")
-        # Return only the part from <user> onwards, excluding the system prompt for cleaner final output
-        # Find the start of the <user> tag in the final_text
-        user_tag_start = final_text.find("<user>")
+        # Return only the part from <user> onwards
+        user_tag_start = final_full_text.rfind("<user>")
         if user_tag_start != -1:
-            return final_text[user_tag_start:]
+            return final_full_text[user_tag_start:]
         else:
-            # Should not happen if prompt_str is non-empty and structure is followed
-            return final_text
+            # Fallback, though <user> should always be in final_full_text if prompt_str is not empty
+            return final_full_text
 

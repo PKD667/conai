@@ -122,7 +122,7 @@ class TestTypedLambdaParser(unittest.TestCase):
     def test_parse_expression_with_complex_types(self):
         self.assertParsesTo("λx:(A -> B) -> C. x", "(λx:((A -> B) -> C). x)")
         self.assertParsesTo("λx:A -> B -> C. x", "(λx:(A -> (B -> C)). x)") # Type is right-associative
-
+    
     # --- Error Handling Tests ---
     def test_parse_error_unexpected_eof(self):
         with self.assertRaisesRegex(ParserSyntaxError, "Expected token IDENTIFIER but got EOF"):
