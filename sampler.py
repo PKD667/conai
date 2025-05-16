@@ -249,12 +249,6 @@ def simplified_sampler(
 
         probs = torch.softmax(logits_for_next_token, dim=-1)
 
-        # plot the probs in a graph
-        print(f"\nLogits for next token: {logits_for_next_token}")
-        print(f"\nProbabilities for next token: {probs}", flush=True)
-
-
-
         # Corrected entropy calculation to handle p=0 cases
         log_probs = torch.log(probs)
         entropy = -torch.sum(probs * log_probs.where(probs > 0, torch.tensor(0.0, device=probs.device)), dim=-1)
@@ -287,6 +281,10 @@ def simplified_sampler(
         
         current_response_str += token_text
         
+        print("-"*10)
+        print(current_response_str)
+        print("-"*10, flush=True)
+        
         if stop_sequences:
             for seq in stop_sequences:
                 if current_response_str.endswith(seq):
@@ -296,7 +294,7 @@ def simplified_sampler(
             if found_stop_sequence:
                 break
 
-        print(token_text, end="", flush=True)
+        #print(token_text, end="", flush=True)
 
         full_input_ids = torch.cat((full_input_ids, next_token_tensor), dim=1)
         current_model_input_ids = full_input_ids

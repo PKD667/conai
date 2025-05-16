@@ -52,5 +52,9 @@ if __name__ == "__main__":
     # Note: The model should be in evaluation mode (set in TransformersModelWrapper)
     # wrapped_model.eval() # Already called in TransformersModelWrapper.__init__
 
-    content = wrapped_model.infer(prompt_str=input_text,tokenizer=wrapped_tokenizer) 
+    content = wrapped_model.infer(
+        prompt_str=input_text,
+        tokenizer=wrapped_tokenizer,
+        entropy_limit=4
+        ) 
     print(content)
